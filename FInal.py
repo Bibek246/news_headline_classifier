@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # news_headline_classifier.py
-# Complete pipeline: AG News classification with TF-IDF+LR, MLP, and DistilBERT,
-# including full validation metrics for DistilBERT.
+# Complete pipeline: AG News classification with TF-IDF+LR, MLP, and optimized DistilBERT,
+# including full validation & test metrics and a final comparison chart.
 
 import os
 import random
@@ -40,19 +40,19 @@ CATEGORIES = ["World", "Sports", "Business", "Sci/Tech"]
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 os.makedirs("models", exist_ok=True)
 
-# 3. Load AG News via Hugging Face
-def load_data_hf():
+# 3. Load & subsample AG News
+def load_data_hf(subset_size=50000):
     ds = load_dataset("ag_news")
-    return ds["train"], ds["test"]
+    train = ds["train"].shuffle(seed=SEED).select(range(subset_size))
+    test  = ds["test"]
+    return train, test
 
-train_ds, test_ds = load_data_hf()
+train_ds, test_ds = load_data_hf(subset_size=50000)
 
-# 4. Prepare Train/Val Split
+# 4. Prepare train/val split
 def prepare_splits(ds, val_size=0.1):
-    titles = ds["Title"]
-    descs  = ds["Description"]
-    texts  = [t + " " + d for t, d in zip(titles, descs)]
-    labels = [idx - 1 for idx in ds["Class Index"]]  # shift 1–4 → 0–3
+    texts = [t + " " + d for t, d in zip(ds["Title"], ds["Description"])]
+    labels = [i - 1 for i in ds["Class Index"]]
     return train_test_split(texts, labels,
                             test_size=val_size,
                             random_state=SEED,
@@ -75,17 +75,17 @@ def train_baseline(X_train, y_train, X_val, y_val):
     lr.fit(Xtr, y_train)
 
     preds = lr.predict(Xvl)
-    print(f"[Baseline] Val Acc: {metrics.accuracy_score(y_val, preds):.4f}")
-    print(metrics.classification_report(y_val, preds, target_names=CATEGORIES))
+    print(f"[Baseline] Val Acc: {accuracy_score(y_val, preds):.4f}")
+    print(classification_report(y_val, preds, target_names=CATEGORIES))
 
-    cm = metrics.confusion_matrix(y_val, preds)
+    cm = confusion_matrix(y_val, preds)
     plt.figure(figsize=(6,5))
     sns.heatmap(cm, annot=True, fmt="d",
                 xticklabels=CATEGORIES,
                 yticklabels=CATEGORIES,
                 cmap="Blues")
-    plt.xlabel("Predicted"); plt.ylabel("Actual")
-    plt.title("Baseline Confusion Matrix")
+    plt.title("Baseline Confusion Matrix (Val)")
+    plt.xlabel("Predicted"); plt.ylabel("True")
     plt.show()
 
     import joblib
@@ -108,7 +108,7 @@ class MLPClassifier(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-def train_mlp(tfidf, X_train, y_train, X_val, y_val, epochs=5):
+def train_mlp(tfidf, X_train, y_train, X_val, y_val, epochs=3):
     Xtr = torch.from_numpy(tfidf.transform(X_train).toarray()).float()
     ytr = torch.tensor(y_train).long()
     Xvl = torch.from_numpy(tfidf.transform(X_val).toarray()).float()
@@ -123,15 +123,16 @@ def train_mlp(tfidf, X_train, y_train, X_val, y_val, epochs=5):
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     criterion = nn.CrossEntropyLoss()
 
+    best_acc = 0
     for epoch in range(1, epochs+1):
         model.train()
-        loss_sum = 0
+        total_loss = 0
         for xb, yb in train_loader:
             xb, yb = xb.to(DEVICE), yb.to(DEVICE)
             out = model(xb)
             loss = criterion(out, yb)
             optimizer.zero_grad(); loss.backward(); optimizer.step()
-            loss_sum += loss.item()
+            total_loss += loss.item()
         model.eval()
         correct = 0
         with torch.no_grad():
@@ -139,24 +140,26 @@ def train_mlp(tfidf, X_train, y_train, X_val, y_val, epochs=5):
                 xb, yb = xb.to(DEVICE), yb.to(DEVICE)
                 pred = model(xb).argmax(dim=1)
                 correct += (pred == yb).sum().item()
-        print(f"[MLP] Epoch {epoch} — Loss: {loss_sum/len(train_loader):.4f}, Val Acc: {correct/len(val_loader.dataset):.4f}")
-    return model
+        acc = correct / len(val_loader.dataset)
+        print(f"[MLP] Epoch {epoch} — Loss: {total_loss/len(train_loader):.4f}, Val Acc: {acc:.4f}")
+        best_acc = max(best_acc, acc)
+    return model, best_acc
 
-mlp_model = train_mlp(tfidf, X_train, y_train, X_val, y_val)
+mlp_model, mlp_val_acc = train_mlp(tfidf, X_train, y_train, X_val, y_val)
 
-# 7. DistilBERT Fine-Tuning with full validation metrics
-def fine_tune_transformer(X_train, y_train, X_val, y_val):
+# 7. DistilBERT fine‑tuning
+def fine_tune_distilbert(X_train, y_train, X_val, y_val):
     hf_train = Dataset.from_dict({"text": X_train, "label": y_train})
     hf_val   = Dataset.from_dict({"text": X_val,   "label": y_val})
     tokenizer = DistilBertTokenizerFast.from_pretrained("distilbert-base-uncased")
 
-    def tokenize_batch(batch):
+    def tokenize_fn(batch):
         return tokenizer(batch["text"],
                          padding="max_length",
                          truncation=True,
                          max_length=32)
-    hf_train = hf_train.map(tokenize_batch, batched=True)
-    hf_val   = hf_val.map(tokenize_batch, batched=True)
+    hf_train = hf_train.map(tokenize_fn, batched=True)
+    hf_val   = hf_val.map(tokenize_fn, batched=True)
     hf_train.set_format("torch", columns=["input_ids","attention_mask","label"])
     hf_val.set_format("torch",   columns=["input_ids","attention_mask","label"])
 
@@ -169,9 +172,10 @@ def fine_tune_transformer(X_train, y_train, X_val, y_val):
         evaluation_strategy="epoch",
         save_strategy="epoch",
         learning_rate=2e-5,
-        per_device_train_batch_size=32,
+        per_device_train_batch_size=16,
+        gradient_accumulation_steps=2,
         per_device_eval_batch_size=64,
-        num_train_epochs=3,
+        num_train_epochs=2,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         fp16=torch.cuda.is_available()
@@ -184,15 +188,13 @@ def fine_tune_transformer(X_train, y_train, X_val, y_val):
         tokenizer=tokenizer
     )
 
-    # Train & get loss
     trainer.train()
     eval_metrics = trainer.evaluate()
-    print(f"[DistilBERT] Eval loss: {eval_metrics['eval_loss']:.4f}")
+    print(f"[DistilBERT] Val loss: {eval_metrics['eval_loss']:.4f}")
 
-    # Full Val Metrics
     preds_out = trainer.predict(hf_val)
-    y_pred    = np.argmax(preds_out.predictions, axis=1)
-    y_true    = preds_out.label_ids
+    y_pred = np.argmax(preds_out.predictions, axis=1)
+    y_true = preds_out.label_ids
 
     print("=== DistilBERT Validation Metrics ===")
     print("Accuracy:", accuracy_score(y_true, y_pred))
@@ -204,22 +206,64 @@ def fine_tune_transformer(X_train, y_train, X_val, y_val):
                 xticklabels=CATEGORIES,
                 yticklabels=CATEGORIES,
                 cmap="Blues")
-    plt.title("DistilBERT Confusion Matrix")
+    plt.title("DistilBERT Confusion Matrix (Val)")
     plt.xlabel("Predicted"); plt.ylabel("True")
     plt.show()
 
     model.save_pretrained("models/distilbert")
     tokenizer.save_pretrained("models/distilbert")
+    return trainer, hf_val
 
-fine_tune_transformer(X_train, y_train, X_val, y_val)
+trainer, hf_val = fine_tune_distilbert(X_train, y_train, X_val, y_val)
 
-# 8. Final Test on Baseline
-titles = test_ds["Title"]
-descs  = test_ds["Description"]
-X_test = [t + " " + d for t, d in zip(titles, descs)]
-y_test = [idx - 1 for idx in test_ds["Class Index"]]
+# 8. Evaluate baseline on TEST
+titles_test = test_ds["Title"]
+descs_test  = test_ds["Description"]
+X_test = [t + " " + d for t, d in zip(titles_test, descs_test)]
+y_test = [i - 1 for i in test_ds["Class Index"]]
 
 Xte = tfidf.transform(X_test)
-preds = lr_model.predict(Xte)
-print(f"[Baseline] Test Acc: {metrics.accuracy_score(y_test, preds):.4f}")
-print(metrics.classification_report(y_test, preds, target_names=CATEGORIES))
+preds_base = lr_model.predict(Xte)
+print(f"[Baseline] Test Acc: {accuracy_score(y_test, preds_base):.4f}")
+print(classification_report(y_test, preds_base, target_names=CATEGORIES))
+
+# 9. Evaluate DistilBERT on TEST
+tokenizer = DistilBertTokenizerFast.from_pretrained("models/distilbert")
+model     = DistilBertForSequenceClassification.from_pretrained("models/distilbert").to(DEVICE)
+
+hf_test = Dataset.from_dict({"text": X_test, "label": y_test})
+hf_test = hf_test.map(lambda b: tokenizer(b["text"], padding="max_length", truncation=True, max_length=32), batched=True)
+hf_test.set_format("torch", columns=["input_ids","attention_mask","label"])
+
+test_trainer = Trainer(model=model, args=TrainingArguments(output_dir="models/distilbert", per_device_eval_batch_size=64))
+preds_test = test_trainer.predict(hf_test)
+y_pred_test = np.argmax(preds_test.predictions, axis=1)
+y_true_test = preds_test.label_ids
+
+print("=== DistilBERT Test Metrics ===")
+print("Accuracy:", accuracy_score(y_true_test, y_pred_test))
+print(classification_report(y_true_test, y_pred_test, target_names=CATEGORIES))
+
+cm_test = confusion_matrix(y_true_test, y_pred_test)
+plt.figure(figsize=(6,5))
+sns.heatmap(cm_test, annot=True, fmt="d",
+            xticklabels=CATEGORIES,
+            yticklabels=CATEGORIES,
+            cmap="Blues")
+plt.title("DistilBERT Confusion Matrix (Test)")
+plt.xlabel("Predicted"); plt.ylabel("True")
+plt.show()
+
+# 10. Final model comparison
+results = {
+    "LR Baseline (Test)": accuracy_score(y_test, preds_base),
+    "MLP (Val)": mlp_val_acc,
+    "DistilBERT (Test)": accuracy_score(y_true_test, y_pred_test)
+}
+plt.figure(figsize=(6,4))
+plt.bar(results.keys(), results.values())
+plt.ylim(0.8,1.0)
+plt.ylabel("Accuracy")
+plt.title("Model Accuracy Comparison")
+plt.xticks(rotation=15)
+plt.show()
