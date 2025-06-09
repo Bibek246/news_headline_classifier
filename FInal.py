@@ -51,8 +51,14 @@ train_ds, test_ds = load_data_hf(subset_size=50000)
 
 # 4. Prepare train/val split
 def prepare_splits(ds, val_size=0.1):
-    texts = [t + " " + d for t, d in zip(ds["Title"], ds["Description"])]
-    labels = [i - 1 for i in ds["Class Index"]]
+    """Split dataset into train/validation using HF ag_news fields."""
+    # The HuggingFace ``ag_news`` dataset provides a single ``text`` field and
+    # zero-indexed ``label`` values.  The original implementation expected the
+    # Kaggle CSV format (``Title``/``Description`` and 1-indexed labels), which
+    # results in a ``KeyError`` when using the HF dataset.  Use the correct
+    # fields here.
+    texts = list(ds["text"])
+    labels = list(ds["label"])
     return train_test_split(texts, labels,
                             test_size=val_size,
                             random_state=SEED,
@@ -217,10 +223,10 @@ def fine_tune_distilbert(X_train, y_train, X_val, y_val):
 trainer, hf_val = fine_tune_distilbert(X_train, y_train, X_val, y_val)
 
 # 8. Evaluate baseline on TEST
-titles_test = test_ds["Title"]
-descs_test  = test_ds["Description"]
-X_test = [t + " " + d for t, d in zip(titles_test, descs_test)]
-y_test = [i - 1 for i in test_ds["Class Index"]]
+# The test split from the HF dataset uses the same ``text`` and ``label``
+titles_test = test_ds["text"]
+X_test = list(titles_test)
+y_test = list(test_ds["label"])
 
 Xte = tfidf.transform(X_test)
 preds_base = lr_model.predict(Xte)
